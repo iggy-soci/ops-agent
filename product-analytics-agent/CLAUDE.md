@@ -1,132 +1,119 @@
 # Product Analytics Pipeline Agent
 
-This agent runs a nightly data pipeline that pulls product analytics data from
-Jira, Pendo, and New Relic, normalizes it by release and product area, and
-writes it to Snowflake.
+This agent runs a data pipeline that pulls product analytics from Pendo,
+normalizes it by release and product area, and writes it to Google Sheets.
 
 ## Purpose
 
-Build and maintain a normalized analytics database that the Product Analytics
-Agent can query to answer questions about feature adoption, release performance,
-and product area health -- without hitting live APIs on every question.
+Build and maintain a normalized analytics database so the product team can
+answer questions about feature adoption and engagement without opening Pendo.
 
 ## How to invoke
 
 Start Claude Code in this directory and say:
-"Run the product analytics pipeline"
+"Run the Pendo pipeline for April 27, 2026"
 
-Or for a specific release:
-"Run the product analytics pipeline for April 27, 2026"
+Or for all recent releases:
+"Run the Pendo pipeline"
 
 ## MCP dependencies
 
-- atlassian (meetsoci.atlassian.net) -- for Jira release items
-- pendo -- for adoption and engagement data
+- pendo — for adoption and engagement data
+- atlassian (meetsoci.atlassian.net) — for release and product area context
 
 ## Environment variables required
 
-Set these in your shell before running:
-
-    NEW_RELIC_API_KEY=<your key>
-    NEW_RELIC_ACCOUNT_ID=<your account id>
-    SNOWFLAKE_ACCOUNT=<account identifier, e.g. xy12345.us-east-1>
-    SNOWFLAKE_USER=<username>
-    SNOWFLAKE_PASSWORD=<password>
-    SNOWFLAKE_DATABASE=PRODUCT_OPS_DB
-    SNOWFLAKE_SCHEMA=PRODUCT_ANALYTICS
-    SNOWFLAKE_WAREHOUSE=COMPUTE_WH
+    APPS_SCRIPT_URL=<deployed web app URL>
+    SHEETS_DB_ID=19ngFwYrm7p7MkWvXD3bH_IFDMu31p7iCDo8Aj6o5hTM
 
 ## Pipeline steps
 
-### Step 1 -- Fetch releases from Jira
-Query the SO project Launches board (board 3801) to get all release dates.
-Releases are the date-based groups shown on that board (e.g. "April 27, 2026").
-Use this JQL to find items for a given release date:
+### Step 1 — Load releases and product areas from Google Sheets
+Read the `releases` and `product_areas` tabs via the Apps Script Web App.
+These are already seeded by bootstrap-data.js.
 
-    project = SO AND "Product[Select List (single choice)]" is not EMPTY
+### Step 2 — For each release + product area combination, query Pendo
+For each product area in each release, query Pendo for the 30-day window
+ending on the release date (period_start = release_date - 30 days,
+period_end = release_date).
 
-Product area is stored in customfield_12645 (field name: "Product").
-Group results by the board's sprint or date grouping field.
+Use the Pendo MCP to retrieve:
+- Total visitor count for the period
+- Active visitor count (visitors with at least 1 event)
+- New visitor count
+- Total account count
+- Active account count
+- Total feature events for features tagged to this product area
+- Total page views for pages tagged to this product area
+- Average time on feature (minutes)
 
-### Step 2 -- Upsert releases and product areas into Snowflake
-For each release date found, upsert into the releases table.
-For each distinct product area value, upsert into product_areas table.
+Calculate:
+- adoption_rate = active_accounts / total_accounts (as decimal, e.g. 0.42)
 
-### Step 3 -- Sync Jira release items
-For each release, fetch all SO tickets where customfield_12645 is set.
-Map each ticket to its release_id and area_id.
-Upsert into jira_release_items.
+Map product area names to Pendo features and pages by matching the area name
+against Pendo feature group names or page group names. Use fuzzy/partial
+matching — e.g. "Social Agent" should match Pendo features containing "Social"
+or "Agent". If no Pendo data is found for an area, log a warning and write
+NULLs for that row rather than skipping it.
 
-Key fields to extract per ticket:
-- key (jira_key)
-- summary
-- issuetype.name (issue_type)
-- status.name + status.statusCategory.key
-- priority.name
-- assignee.displayName
-- reporter.displayName
-- created (created_date)
-- resolutiondate (resolved_date)
-- components[].name (array)
-- labels[] (array)
-- customfield_12645.value (product area)
+### Step 3 — Write to Google Sheets
+For each release + product area combination, upsert a row into the
+`pendo_adoption` tab using the Apps Script Web App.
 
-### Step 4 -- Pull Pendo adoption data
-For each product_area + release combination, query Pendo for the 30-day
-window ending on the release date. Use the Pendo MCP to:
-- Get visitor counts (total, active, new)
-- Get account counts (total, active)
-- Get feature event totals for features tagged to that product area
-- Calculate adoption_rate = active_accounts / total_accounts
+Upsert key: combination of release_id + area_id (use adoption_id as the
+unique key, constructed as `pendo-<release_id>-<area_id>`).
 
-Map product area names to Pendo feature/page groups by name matching.
-If no Pendo data is found for an area, log a warning and continue.
+Fields to write:
+- adoption_id: `pendo-<release_id>-<area_id>`
+- release_id
+- area_id
+- total_visitors
+- active_visitors
+- new_visitors
+- total_accounts
+- active_accounts
+- feature_events
+- page_views
+- avg_time_on_feature
+- adoption_rate
+- period_start
+- period_end
+- pipeline_run_at: current timestamp
 
-### Step 5 -- Pull New Relic performance data
-For each product_area + release combination, query New Relic REST API for
-the same 30-day window using NRQL via the GraphQL API:
-
-Endpoint: https://api.newrelic.com/graphql
-Auth header: Api-Key: $NEW_RELIC_API_KEY
-
-NRQL query per product area:
-    SELECT average(duration)*1000 as avg_ms,
-           percentile(duration*1000, 95) as p95_ms,
-           percentile(duration*1000, 99) as p99_ms,
-           rate(count(*), 1 minute) as throughput,
-           filter(count(*), WHERE error IS true) / count(*) * 100 as error_rate
-    FROM Transaction
-    WHERE appName LIKE '%<product_area>%'
-    SINCE '<period_start>'
-    UNTIL '<period_end>'
-
-If no matching app is found for a product area, log and continue.
-
-### Step 6 -- Write to Snowflake
-Upsert all collected data into:
-- pendo_adoption (unique on release_id + area_id)
-- newrelic_performance (unique on release_id + area_id)
-
-Log the run in pipeline_runs with counts and any errors.
+### Step 4 — Log the pipeline run
+Write a row to the `pipeline_runs` tab with:
+- run_id: new UUID
+- started_at
+- completed_at
+- status: "completed" or "failed"
+- releases_synced: number of releases processed
+- items_synced: number of pendo_adoption rows written
+- errors: any error messages as JSON array
 
 ## Behavior rules
 
-- Never skip a release even if Pendo or New Relic data is missing -- write
-  what you have and leave missing columns as NULL
+- Never skip a product area even if Pendo returns no data — write NULLs
 - Always upsert so reruns are safe and idempotent
 - Log every step to stdout with timestamps
-- If Snowflake is unavailable, write output to ./output/<run_date>.json
-  as a fallback so data is never lost
-- Never modify source systems -- read-only pipeline
-- On error in any single step, log and continue, report all errors at end
+- On any error, log and continue — never stop mid-run
+- This is read-only from Pendo — never write back to Pendo
 
-## Jira field reference
+## Product area → Pendo mapping guide
 
-| What           | Jira field name   | API path                  |
-|----------------|-------------------|---------------------------|
-| Product area   | Product           | customfield_12645.value   |
-| Issue type     | Issue Type        | issuetype.name            |
-| Status         | Status            | status.name               |
-| Status cat.    | (derived)         | status.statusCategory.key |
-| Components     | Component/s       | components[].name         |
-| Resolution dt. | Resolved          | resolutiondate            |
+When searching Pendo, try these name patterns per area:
+
+| Product Area   | Search terms in Pendo          |
+|----------------|-------------------------------|
+| Social Agent   | Social, Agent, Genius Social  |
+| Search Agent   | Search, Genius Search         |
+| Agents Core    | Agent, Genius, Engagements    |
+| Core Social    | Social, Scheduler, Post       |
+| Core Listings  | Listings, LIS                 |
+| Reputation     | Reviews, Chat, Surveys        |
+| Reporting      | Report, REP                   |
+| Data Management| Data Management, DIS          |
+| FinServ        | Compliance, Shield, CPL       |
+| Local Adoption | Local, Community Calendar     |
+| Pages          | Pages, LLP                    |
+| Voice of Customer | VoC, Voice                 |
+| Architecture   | (skip — backend, no Pendo data)|

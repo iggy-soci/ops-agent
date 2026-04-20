@@ -4,10 +4,11 @@
   "description": "Nightly pipeline agent for SOCi Product Analytics",
   "type": "module",
   "scripts": {
+    "setup": "node setup.js",
     "start": "node pipeline-server.js",
-    "run-now": "node -e \"fetch('http://127.0.0.1:3001/run', {method:'POST'}).then(r=>r.json()).then(console.log)\"",
+    "run-now": "node -e \"fetch('http://127.0.0.1:3001/run',{method:'POST'}).then(r=>r.json()).then(console.log)\"",
     "status": "node -e \"fetch('http://127.0.0.1:3001/status').then(r=>r.json()).then(d=>console.log(JSON.stringify(d,null,2)))\"",
-    "run-release": "node -e \"const d=process.argv[2]; fetch('http://127.0.0.1:3001/run?release='+encodeURIComponent(d),{method:'POST'}).then(r=>r.json()).then(console.log)\" --"
+    "run-release": "node -e \"const d=process.argv[2];fetch('http://127.0.0.1:3001/run?release='+encodeURIComponent(d),{method:'POST'}).then(r=>r.json()).then(console.log)\" --"
   },
   "engines": {
     "node": ">=18"
